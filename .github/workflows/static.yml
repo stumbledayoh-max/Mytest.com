@@ -10,6 +10,15 @@ on:
           - windows-2022
           - windows-2025
           - windows-latest
+      rdp_user:
+        description: "Usuário do RDP"
+        type: string
+        default: RDP
+        required: true
+      rdp_password:
+        description: "Senha do RDP (mín. 8 caracteres, com maiúscula, minúscula, número e símbolo). Vazio = gera aleatória"
+        type: string
+        required: false
 
 defaults:
   run:
@@ -197,37 +206,51 @@ jobs:
       # 4. CREAR USUARIO RDP
       # ─────────────────────────────────────────────
       - name: Create RDP User
+        env:
+          IN_USER: ${{ inputs.rdp_user }}
+          IN_PASS: ${{ inputs.rdp_password }}
         run: |
           . C:\rdp-helpers\state.ps1
-          $charSet = @{
-            Upper   = [char[]](65..90)
-            Lower   = [char[]](97..122)
-            Number  = [char[]](48..57)
-            Special = [char[]]@(33,35,36,37,38,42,43,45,61,64)
-          }
-          $rawPassword  = @()
-          $rawPassword += $charSet.Upper   | Get-Random -Count 4
-          $rawPassword += $charSet.Lower   | Get-Random -Count 4
-          $rawPassword += $charSet.Number  | Get-Random -Count 4
-          $rawPassword += $charSet.Special | Get-Random -Count 4
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
 
-          # Oculta a senha nos logs (importante se o repo for público)
-          Write-Host "::add-mask::$password"
+          $user = if ([string]::IsNullOrWhiteSpace($env:IN_USER)) { "RDP" } else { $env:IN_USER.Trim() }
+
+          if ([string]::IsNullOrEmpty($env:IN_PASS)) {
+            # Sem senha informada: gera uma aleatória
+            $charSet = @{
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
+              Special = [char[]]@(33,35,36,37,38,42,43,45,61,64)
+            }
+            $rawPassword  = @()
+            $rawPassword += $charSet.Upper   | Get-Random -Count 4
+            $rawPassword += $charSet.Lower   | Get-Random -Count 4
+            $rawPassword += $charSet.Number  | Get-Random -Count 4
+            $rawPassword += $charSet.Special | Get-Random -Count 4
+            $password = -join ($rawPassword | Sort-Object { Get-Random })
+            Write-Host "Nenhuma senha informada, gerada aleatoriamente."
+          } else {
+            $password = $env:IN_PASS
+          }
 
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Administrators"       -Member "RDP" -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
+          if (Get-LocalUser -Name $user -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name $user -Password $securePass
+          } else {
+            New-LocalUser -Name $user -Password $securePass -AccountNeverExpires -ErrorAction Stop | Out-Null
+          }
+          Add-LocalGroupMember -Group "Administrators"       -Member $user -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $user -ErrorAction SilentlyContinue
 
-          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
-            Write-Error "User creation failed"; exit 1
+          if (-not (Get-LocalUser -Name $user -ErrorAction SilentlyContinue)) {
+            Write-Error "User creation failed (senha pode não atender à complexidade do Windows)"; exit 1
           }
 
+          echo "RDP_USER=$user" >> $env:GITHUB_ENV
           echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
           # A senha NÃO é salva no JSON (ele vai para o cache)
-          Update-State -Step "rdp_user" -Set @{ rdp_user = "RDP" }
-          Write-Host "RDP user created."
+          Update-State -Step "rdp_user" -Set @{ rdp_user = $user }
+          Write-Host "RDP user '$user' created."
 
       # ─────────────────────────────────────────────
       # 5. INSTALAR TAILSCALE
@@ -289,7 +312,7 @@ jobs:
           Write-Host "╠══════════════════════════════════════╣"
           Write-Host "║  OS:       ${{ inputs.os }}"
           Write-Host "║  IP:       $env:TAILSCALE_IP"
-          Write-Host "║  User:     RDP"
+          Write-Host "║  User:     $env:RDP_USER"
           Write-Host "║  Password: $env:RDP_PASSWORD"
           Write-Host "╠══════════════════════════════════════╣"
           Write-Host "║  STATE: $env:STATE_FILE"
