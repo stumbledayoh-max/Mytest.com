@@ -1,43 +1,348 @@
-# Simple workflow for deploying static content to GitHub Pages
-name: Deploy static content to Pages
-
+name: RDP
 on:
-  # Runs on pushes targeting the default branch
-  push:
-    branches: ["main"]
-
-  # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
+    inputs:
+      os:
+        description: "Versão do Windows (Windows 10 não existe mais nos runners; 2022 é o mais próximo)"
+        type: choice
+        default: windows-2022
+        options:
+          - windows-2022
+          - windows-2025
+          - windows-latest
 
-# Sets permissions of the GITHUB_TOKEN to allow deployment to GitHub Pages
-permissions:
-  contents: read
-  pages: write
-  id-token: write
-
-# Allow only one concurrent deployment, skipping runs queued between the run in-progress and latest queued.
-# However, do NOT cancel in-progress runs as we want to allow these production deployments to complete.
-concurrency:
-  group: "pages"
-  cancel-in-progress: false
+defaults:
+  run:
+    shell: pwsh
 
 jobs:
-  # Single deploy job since we're just deploying
-  deploy:
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    runs-on: ubuntu-latest
+  secure-rdp:
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 360   # máximo permitido em runners hospedados
+
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Setup Pages
-        uses: actions/configure-pages@v5
-      - name: Upload artifact
-        uses: actions/upload-pages-artifact@v3
+      # ─────────────────────────────────────────────
+      # 0. RESTAURAR ESTADO ANTERIOR (JSON)
+      # ─────────────────────────────────────────────
+      - name: Restore system state (JSON)
+        uses: actions/cache/restore@v4
         with:
-          # Upload entire repository
-          path: '.'
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
+          path: D:\rdp-state\system-state.json
+          key: rdp-state-${{ inputs.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            rdp-state-${{ inputs.os }}-
+
+      - name: Init state helper
+        run: |
+          $dir  = "D:\rdp-state"
+          $file = "$dir\system-state.json"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+
+          # Helper reutilizável por todas as etapas
+          $helperDir = "C:\rdp-helpers"
+          New-Item -ItemType Directory -Force -Path $helperDir | Out-Null
+          @'
+          function Update-State {
+            param([hashtable]$Set, [string]$Step)
+            $p = $env:STATE_FILE
+            $s = if (Test-Path $p) { Get-Content $p -Raw | ConvertFrom-Json -AsHashtable } else { @{} }
+            if (-not $s.steps) { $s.steps = @{} }
+            if ($Step) { $s.steps[$Step] = (Get-Date).ToString('o') }
+            if ($Set)  { foreach ($k in $Set.Keys) { $s[$k] = $Set[$k] } }
+            $s.last_update = (Get-Date).ToString('o')
+            $s | ConvertTo-Json -Depth 6 | Set-Content -Path $p -Encoding utf8
+          }
+          '@ | Set-Content "$helperDir\state.ps1" -Encoding utf8
+
+          $prev = if (Test-Path $file) { Get-Content $file -Raw | ConvertFrom-Json -AsHashtable } else { $null }
+          if ($prev) { Write-Host "Estado anterior encontrado: execução #$($prev.run_count)" }
+          else       { Write-Host "Sem estado anterior (primeira execução)." }
+
+          $state = @{
+            schema        = 1
+            os_image      = "${{ inputs.os }}"
+            run_id        = "${{ github.run_id }}"
+            run_count     = [int]($prev.run_count ?? 0) + 1
+            first_started = ($prev.first_started ?? (Get-Date).ToString('o'))
+            started_at    = (Get-Date).ToString('o')
+            previous_run  = if ($prev) { @{
+                run_id      = $prev.run_id
+                last_update = $prev.last_update
+                ticks       = $prev.ticks
+                steps       = $prev.steps
+              } } else { $null }
+            steps         = @{}
+            ticks         = 0
+          }
+          $state | ConvertTo-Json -Depth 6 | Set-Content $file -Encoding utf8
+
+          echo "STATE_FILE=$file" >> $env:GITHUB_ENV
+          . "$helperDir\state.ps1"
+          $env:STATE_FILE = $file
+          Update-State -Step "init"
+
+      # ─────────────────────────────────────────────
+      # 1. LIBERAR ESPACIO Y MONTAR DISCO EXTRA
+      # ─────────────────────────────────────────────
+      - name: Free Up Space & Mount Extra Disk
+        run: |
+          . C:\rdp-helpers\state.ps1
+          Write-Host "=== Disk before cleanup ==="
+          Get-PSDrive -PSProvider FileSystem | Select-Object Name, Used, Free | Format-Table
+
+          $toRemove = @(
+            "$env:SystemDrive\hostedtoolcache\windows\Ruby",
+            "$env:SystemDrive\hostedtoolcache\windows\go",
+            "$env:SystemDrive\hostedtoolcache\windows\Python",
+            "$env:ProgramFiles\dotnet",
+            "$env:ProgramFiles\MongoDB",
+            "$env:ProgramFiles\PostgreSQL",
+            "${env:ProgramFiles(x86)}\Google\Chrome",
+            "$env:ProgramFiles\Mozilla Firefox"
+          )
+          foreach ($path in $toRemove) {
+            if (Test-Path $path) {
+              Remove-Item $path -Recurse -Force -ErrorAction SilentlyContinue
+              Write-Host "Removed: $path"
+            }
+          }
+
+          Write-Host "=== Disk D: info ==="
+          Get-PSDrive D -ErrorAction SilentlyContinue
+
+          # VHD dinâmico de 100GB
+          $extra = $null
+          try {
+            $vhdPath = "D:\extra_disk.vhdx"
+            New-VHD -Path $vhdPath -SizeBytes 100GB -Dynamic -ErrorAction Stop | Out-Null
+            Mount-VHD -Path $vhdPath -ErrorAction Stop
+            $disk = Get-Disk | Where-Object { $_.OperationalStatus -eq 'Online' -and $_.PartitionStyle -eq 'RAW' } | Select-Object -Last 1
+            if ($disk) {
+              $part = Initialize-Disk -Number $disk.Number -PartitionStyle MBR -PassThru |
+                New-Partition -AssignDriveLetter -UseMaximumSize
+              $part | Format-Volume -FileSystem NTFS -NewFileSystemLabel "ExtraDisk" -Confirm:$false | Out-Null
+              $extra = "$($part.DriveLetter):"
+            }
+          } catch { Write-Warning "VHD extra não montado: $_" }
+
+          Write-Host "=== Disk after setup ==="
+          Get-PSDrive -PSProvider FileSystem | Select-Object Name, Used, Free | Format-Table
+
+          New-Item -ItemType Directory -Force -Path "D:\storage" | Out-Null
+          echo "EXTRA_DISK=$extra" >> $env:GITHUB_ENV
+          echo "STORAGE_ROOT=D:\storage" >> $env:GITHUB_ENV
+
+          Update-State -Step "disks" -Set @{ extra_disk = $extra; storage_root = "D:\storage" }
+
+      # ─────────────────────────────────────────────
+      # 2. INSTALAR MESA3D (OpenGL SOFTWARE RENDERER)
+      # ─────────────────────────────────────────────
+      - name: Install Mesa3D OpenGL (Software GPU)
+        run: |
+          . C:\rdp-helpers\state.ps1
+          $mesaUrl = "https://github.com/pal1000/mesa-dist-win/releases/download/24.3.4/mesa3d-24.3.4-release-mingw.7z"
+          $sevenZipUrl = "https://www.7-zip.org/a/7zr.exe"
+
+          Invoke-WebRequest -Uri $sevenZipUrl -OutFile "$env:TEMP\7zr.exe" -UseBasicParsing
+          Write-Host "Downloading Mesa3D..."
+          Invoke-WebRequest -Uri $mesaUrl -OutFile "$env:TEMP\mesa3d.7z" -UseBasicParsing
+
+          $mesaDir = "C:\mesa3d"
+          New-Item -ItemType Directory -Force -Path $mesaDir | Out-Null
+          & "$env:TEMP\7zr.exe" x "$env:TEMP\mesa3d.7z" -o"$mesaDir" -y | Out-Null
+
+          $installScript = Get-ChildItem -Path $mesaDir -Filter "systemwidedeploy.cmd" -Recurse | Select-Object -First 1
+          if ($installScript) {
+            Write-Host "Installing Mesa3D system-wide..."
+            & cmd /c "`"$($installScript.FullName)`" x64"
+          } else {
+            $x64dir = Get-ChildItem -Path $mesaDir -Filter "x64" -Recurse -Directory | Select-Object -First 1
+            if ($x64dir) {
+              Copy-Item "$($x64dir.FullName)\*.dll" "C:\Windows\System32\" -Force -ErrorAction SilentlyContinue
+            }
+          }
+
+          $openglDll = Test-Path "C:\Windows\System32\opengl32.dll"
+          Write-Host "OpenGL DLL present: $openglDll"
+
+          $vcUrl = "https://aka.ms/vs/17/release/vc_redist.x64.exe"
+          Invoke-WebRequest -Uri $vcUrl -OutFile "$env:TEMP\vc_redist.x64.exe" -UseBasicParsing
+          Start-Process "$env:TEMP\vc_redist.x64.exe" -ArgumentList "/quiet", "/norestart" -Wait
+
+          Update-State -Step "mesa3d" -Set @{ opengl_dll = $openglDll }
+          Write-Host "Mesa3D (software OpenGL) installed successfully"
+
+      # ─────────────────────────────────────────────
+      # 3. CONFIGURAR RDP
+      # ─────────────────────────────────────────────
+      - name: Configure RDP Settings
+        run: |
+          . C:\rdp-helpers\state.ps1
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "SecurityLayer" -Value 0 -Force
+
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          Restart-Service -Name TermService -Force
+          Update-State -Step "rdp_config"
+          Write-Host "RDP configured."
+
+      # ─────────────────────────────────────────────
+      # 4. CREAR USUARIO RDP
+      # ─────────────────────────────────────────────
+      - name: Create RDP User
+        run: |
+          . C:\rdp-helpers\state.ps1
+          $charSet = @{
+            Upper   = [char[]](65..90)
+            Lower   = [char[]](97..122)
+            Number  = [char[]](48..57)
+            Special = [char[]]@(33,35,36,37,38,42,43,45,61,64)
+          }
+          $rawPassword  = @()
+          $rawPassword += $charSet.Upper   | Get-Random -Count 4
+          $rawPassword += $charSet.Lower   | Get-Random -Count 4
+          $rawPassword += $charSet.Number  | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+
+          # Oculta a senha nos logs (importante se o repo for público)
+          Write-Host "::add-mask::$password"
+
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators"       -Member "RDP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
+
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+            Write-Error "User creation failed"; exit 1
+          }
+
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+          # A senha NÃO é salva no JSON (ele vai para o cache)
+          Update-State -Step "rdp_user" -Set @{ rdp_user = "RDP" }
+          Write-Host "RDP user created."
+
+      # ─────────────────────────────────────────────
+      # 5. INSTALAR TAILSCALE
+      # ─────────────────────────────────────────────
+      - name: Install Tailscale
+        run: |
+          . C:\rdp-helpers\state.ps1
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installer = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installer -UseBasicParsing
+          Start-Process msiexec.exe -ArgumentList "/i","`"$installer`"","/quiet","/norestart" -Wait
+          Remove-Item $installer -Force
+          Update-State -Step "tailscale_install"
+
+      # ─────────────────────────────────────────────
+      # 6. CONECTAR TAILSCALE
+      # ─────────────────────────────────────────────
+      - name: Connect Tailscale
+        run: |
+          . C:\rdp-helpers\state.ps1
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          & $ts up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname="gh-${{ inputs.os }}-$env:GITHUB_RUN_ID"
+
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 15) {
+            Start-Sleep -Seconds 4
+            $tsIP = & $ts ip -4 2>$null
+            $retries++
+          }
+
+          if (-not $tsIP) { Write-Error "Tailscale IP not assigned."; exit 1 }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Update-State -Step "tailscale_up" -Set @{ tailscale_ip = "$tsIP" }
+          Write-Host "Tailscale IP: $tsIP"
+
+      # ─────────────────────────────────────────────
+      # 7. VERIFICAR RDP
+      # ─────────────────────────────────────────────
+      - name: Verify RDP
+        run: |
+          . C:\rdp-helpers\state.ps1
+          $test = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $test.TcpTestSucceeded) {
+            Write-Error "RDP port 3389 not reachable"; exit 1
+          }
+          Update-State -Step "rdp_verified"
+          Write-Host "RDP reachable on port 3389 ✓"
+
+      # ─────────────────────────────────────────────
+      # 8. MANTENER SESIÓN ACTIVA (+ guardar estado)
+      # ─────────────────────────────────────────────
+      - name: Keep Alive & Show Credentials
+        run: |
+          . C:\rdp-helpers\state.ps1
+          Write-Host ""
+          Write-Host "╔══════════════════════════════════════╗"
+          Write-Host "║         RDP ACCESS INFO              ║"
+          Write-Host "╠══════════════════════════════════════╣"
+          Write-Host "║  OS:       ${{ inputs.os }}"
+          Write-Host "║  IP:       $env:TAILSCALE_IP"
+          Write-Host "║  User:     RDP"
+          Write-Host "║  Password: $env:RDP_PASSWORD"
+          Write-Host "╠══════════════════════════════════════╣"
+          Write-Host "║  STATE: $env:STATE_FILE"
+          Write-Host "╚══════════════════════════════════════╝"
+          Write-Host ""
+
+          # Termina sozinho em 340 min para dar tempo de salvar o estado
+          $deadline = (Get-Date).AddMinutes(340)
+          $i = 0
+          while ((Get-Date) -lt $deadline) {
+            $i++
+            $disks = @{}
+            Get-PSDrive -PSProvider FileSystem | ForEach-Object {
+              $disks[$_.Name] = @{
+                free_gb = [math]::Round($_.Free/1GB,1)
+                used_gb = [math]::Round($_.Used/1GB,1)
+              }
+            }
+            Update-State -Step "keepalive" -Set @{
+              ticks          = $i
+              disks_snapshot = $disks
+              uptime_min     = [math]::Round(((Get-Date) - (Get-CimInstance Win32_OperatingSystem).LastBootUpTime).TotalMinutes,1)
+              rdp_sessions   = @((quser 2>$null)).Count
+            }
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Session active — tick $i (estado salvo)"
+            Start-Sleep -Seconds 300
+          }
+          Write-Host "Tempo máximo atingido, encerrando para salvar o estado."
+
+      # ─────────────────────────────────────────────
+      # 9. SALVAR ESTADO FINAL (roda mesmo se cancelar/falhar)
+      # ─────────────────────────────────────────────
+      - name: Mark session end
+        if: always()
+        run: |
+          if (Test-Path C:\rdp-helpers\state.ps1) {
+            . C:\rdp-helpers\state.ps1
+            Update-State -Step "ended" -Set @{ ended_at = (Get-Date).ToString('o') }
+            Get-Content $env:STATE_FILE
+          }
+
+      - name: Save system state (JSON)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: D:\rdp-state\system-state.json
+          key: rdp-state-${{ inputs.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # Opcional: também baixa o JSON como artefato (visível na aba da execução)
+      - name: Upload state artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: system-state-${{ inputs.os }}
+          path: D:\rdp-state\system-state.json
+          retention-days: 30
