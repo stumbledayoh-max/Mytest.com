@@ -10,6 +10,14 @@ on:
           - windows-2022
           - windows-2025
           - windows-latest
+      access:
+        description: "Como acessar a máquina"
+        type: choice
+        default: tailscale
+        options:
+          - tailscale
+          - anydesk
+          - rustdesk
       rdp_user:
         description: "Usuário do RDP"
         type: string
@@ -212,50 +220,64 @@ jobs:
         run: |
           . C:\rdp-helpers\state.ps1
 
-          $user = if ([string]::IsNullOrWhiteSpace($env:IN_USER)) { "RDP" } else { $env:IN_USER.Trim() }
+          # Desliga a exigência de complexidade/tamanho para aceitar qualquer senha
+          net accounts /minpwlen:0 /minpwage:0 /maxpwage:unlimited | Out-Null
+          $cfg = "$env:TEMP\sec.cfg"
+          secedit /export /cfg $cfg | Out-Null
+          (Get-Content $cfg) `
+            -replace 'PasswordComplexity\s*=\s*1','PasswordComplexity = 0' `
+            -replace 'MinimumPasswordLength\s*=\s*\d+','MinimumPasswordLength = 0' |
+            Set-Content $cfg -Encoding Unicode
+          secedit /configure /db "$env:TEMP\sec.sdb" /cfg $cfg /areas SECURITYPOLICY | Out-Null
 
-          if ([string]::IsNullOrEmpty($env:IN_PASS)) {
-            # Sem senha informada: gera uma aleatória
-            $charSet = @{
-              Upper   = [char[]](65..90)
-              Lower   = [char[]](97..122)
-              Number  = [char[]](48..57)
-              Special = [char[]]@(33,35,36,37,38,42,43,45,61,64)
+          function New-RandomPassword {
+            $c = @{
+              U = [char[]](65..90); L = [char[]](97..122)
+              N = [char[]](48..57); S = [char[]]@(33,35,36,37,38,42,43,45,61,64)
             }
-            $rawPassword  = @()
-            $rawPassword += $charSet.Upper   | Get-Random -Count 4
-            $rawPassword += $charSet.Lower   | Get-Random -Count 4
-            $rawPassword += $charSet.Number  | Get-Random -Count 4
-            $rawPassword += $charSet.Special | Get-Random -Count 4
-            $password = -join ($rawPassword | Sort-Object { Get-Random })
-            Write-Host "Nenhuma senha informada, gerada aleatoriamente."
-          } else {
-            $password = $env:IN_PASS
+            $r  = @()
+            $r += $c.U | Get-Random -Count 4
+            $r += $c.L | Get-Random -Count 4
+            $r += $c.N | Get-Random -Count 4
+            $r += $c.S | Get-Random -Count 4
+            -join ($r | Sort-Object { Get-Random })
           }
 
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          if (Get-LocalUser -Name $user -ErrorAction SilentlyContinue) {
-            Set-LocalUser -Name $user -Password $securePass
-          } else {
-            New-LocalUser -Name $user -Password $securePass -AccountNeverExpires -ErrorAction Stop | Out-Null
+          $user = if ([string]::IsNullOrWhiteSpace($env:IN_USER)) { "RDP" } else { $env:IN_USER.Trim() }
+          $password = if ([string]::IsNullOrEmpty($env:IN_PASS)) { New-RandomPassword } else { $env:IN_PASS }
+
+          function Set-RdpUser($u, $pw) {
+            $sec = ConvertTo-SecureString $pw -AsPlainText -Force
+            if (Get-LocalUser -Name $u -ErrorAction SilentlyContinue) {
+              Set-LocalUser -Name $u -Password $sec -ErrorAction Stop
+            } else {
+              New-LocalUser -Name $u -Password $sec -AccountNeverExpires -ErrorAction Stop | Out-Null
+            }
           }
+
+          try {
+            Set-RdpUser $user $password
+          } catch {
+            Write-Warning "Senha recusada pelo Windows: $($_.Exception.Message)"
+            Write-Warning "Gerando uma senha aleatória no lugar."
+            $password = New-RandomPassword
+            Set-RdpUser $user $password
+          }
+
           Add-LocalGroupMember -Group "Administrators"       -Member $user -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $user -ErrorAction SilentlyContinue
-
-          if (-not (Get-LocalUser -Name $user -ErrorAction SilentlyContinue)) {
-            Write-Error "User creation failed (senha pode não atender à complexidade do Windows)"; exit 1
-          }
 
           echo "RDP_USER=$user" >> $env:GITHUB_ENV
           echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
           # A senha NÃO é salva no JSON (ele vai para o cache)
-          Update-State -Step "rdp_user" -Set @{ rdp_user = $user }
+          Update-State -Step "rdp_user" -Set @{ rdp_user = $user; access = "${{ inputs.access }}" }
           Write-Host "RDP user '$user' created."
 
       # ─────────────────────────────────────────────
       # 5. INSTALAR TAILSCALE
       # ─────────────────────────────────────────────
       - name: Install Tailscale
+        if: ${{ inputs.access == 'tailscale' }}
         run: |
           . C:\rdp-helpers\state.ps1
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
@@ -269,6 +291,7 @@ jobs:
       # 6. CONECTAR TAILSCALE
       # ─────────────────────────────────────────────
       - name: Connect Tailscale
+        if: ${{ inputs.access == 'tailscale' }}
         run: |
           . C:\rdp-helpers\state.ps1
           $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
@@ -291,6 +314,7 @@ jobs:
       # 7. VERIFICAR RDP
       # ─────────────────────────────────────────────
       - name: Verify RDP
+        if: ${{ inputs.access == 'tailscale' }}
         run: |
           . C:\rdp-helpers\state.ps1
           $test = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
@@ -299,6 +323,65 @@ jobs:
           }
           Update-State -Step "rdp_verified"
           Write-Host "RDP reachable on port 3389 ✓"
+
+      # ─────────────────────────────────────────────
+      # 7b. ANYDESK
+      # ─────────────────────────────────────────────
+      - name: Install AnyDesk
+        if: ${{ inputs.access == 'anydesk' }}
+        run: |
+          . C:\rdp-helpers\state.ps1
+          $dl  = "$env:TEMP\AnyDesk.exe"
+          $dir = "C:\Program Files (x86)\AnyDesk"
+          Invoke-WebRequest -Uri "https://download.anydesk.com/AnyDesk.exe" -OutFile $dl -UseBasicParsing
+          Start-Process $dl -ArgumentList "--install `"$dir`" --start-with-win --silent" -Wait
+          Start-Sleep -Seconds 10
+          Start-Service AnyDesk -ErrorAction SilentlyContinue
+
+          $exe = "$dir\AnyDesk.exe"
+          # Senha para acesso sem supervisão
+          $env:RDP_PASSWORD | & $exe --set-password | Out-Null
+
+          $id = $null
+          for ($i = 0; $i -lt 15 -and -not $id; $i++) {
+            Start-Sleep -Seconds 4
+            $out = (& $exe --get-id | Out-String).Trim()
+            if ($out -match '^\d{6,}$') { $id = $out }
+          }
+          if (-not $id) { Write-Error "Não consegui obter o ID do AnyDesk."; exit 1 }
+
+          echo "ACCESS_ID=$id" >> $env:GITHUB_ENV
+          Update-State -Step "anydesk" -Set @{ anydesk_id = $id }
+          Write-Host "AnyDesk ID: $id"
+
+      # ─────────────────────────────────────────────
+      # 7c. RUSTDESK
+      # ─────────────────────────────────────────────
+      - name: Install RustDesk
+        if: ${{ inputs.access == 'rustdesk' }}
+        run: |
+          . C:\rdp-helpers\state.ps1
+          $ver = "1.3.8"
+          $dl  = "$env:TEMP\rustdesk.exe"
+          Invoke-WebRequest -Uri "https://github.com/rustdesk/rustdesk/releases/download/$ver/rustdesk-$ver-x86_64.exe" -OutFile $dl -UseBasicParsing
+          Start-Process $dl -ArgumentList "--silent-install" -Wait
+          Start-Sleep -Seconds 15
+          Start-Service RustDesk -ErrorAction SilentlyContinue
+
+          $exe = "C:\Program Files\RustDesk\rustdesk.exe"
+          & $exe --password "$env:RDP_PASSWORD" | Out-Null
+
+          $id = $null
+          for ($i = 0; $i -lt 15 -and -not $id; $i++) {
+            Start-Sleep -Seconds 4
+            $out = (& $exe --get-id | Out-String).Trim()
+            if ($out -match '^\d{6,}$') { $id = $out }
+          }
+          if (-not $id) { Write-Error "Não consegui obter o ID do RustDesk."; exit 1 }
+
+          echo "ACCESS_ID=$id" >> $env:GITHUB_ENV
+          Update-State -Step "rustdesk" -Set @{ rustdesk_id = $id }
+          Write-Host "RustDesk ID: $id"
 
       # ─────────────────────────────────────────────
       # 8. MANTENER SESIÓN ACTIVA (+ guardar estado)
@@ -311,9 +394,16 @@ jobs:
           Write-Host "║         RDP ACCESS INFO              ║"
           Write-Host "╠══════════════════════════════════════╣"
           Write-Host "║  OS:       ${{ inputs.os }}"
-          Write-Host "║  IP:       $env:TAILSCALE_IP"
-          Write-Host "║  User:     $env:RDP_USER"
-          Write-Host "║  Password: $env:RDP_PASSWORD"
+          Write-Host "║  Modo:     ${{ inputs.access }}"
+          if ("${{ inputs.access }}" -eq "tailscale") {
+            Write-Host "║  IP:       $env:TAILSCALE_IP"
+            Write-Host "║  User:     $env:RDP_USER"
+            Write-Host "║  Password: $env:RDP_PASSWORD"
+          } else {
+            Write-Host "║  ID:       $env:ACCESS_ID"
+            Write-Host "║  Password: $env:RDP_PASSWORD"
+            Write-Host "║  (Windows user: $env:RDP_USER)"
+          }
           Write-Host "╠══════════════════════════════════════╣"
           Write-Host "║  STATE: $env:STATE_FILE"
           Write-Host "╚══════════════════════════════════════╝"
